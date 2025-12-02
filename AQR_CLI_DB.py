@@ -1,7 +1,11 @@
 import sqlite3
 from collections import defaultdict
 import requests
+import statistics
 DB_FILE = "shots.db"
+
+# Global cache for AQR statistics
+AQR_STATS_CACHE = {}
 
 # ============================================================
 # 0. ---- DB CONNECTION
@@ -103,10 +107,7 @@ def fetch_assists_by_assister(assister_id, team_abbrev, season):
 
 
 def row_to_dict(row):
-    """
-    Convert DB row → dict using fixed column ordering.
-    This matches your shots table exactly.
-    """
+
     columns = [
         "id", "gid", "game_date", "period", "time", "poss_num",
         "player", "player_id", "team", "opponent",
@@ -268,7 +269,11 @@ def get_distance_factor(shot):
     # fallback (shouldn't happen)
     return 1.0
 
-def compute_AQR_for_shot(shot, skills, season):
+def compute_AQR_for_shot_raw(shot, skills, season):
+    """
+    Compute raw AQR (internal use only).
+    Returns the raw multiplicative AQR value.
+    """
     zone = get_zone(shot)
 
     creation = get_creation_boost(shot)
@@ -281,6 +286,185 @@ def compute_AQR_for_shot(shot, skills, season):
 
 
 # ============================================================
+# 5.5. ------- AQR NORMALIZATION (1-100 SCALE)
+# ============================================================
+
+def fetch_all_assists(season):
+    """Fetch all assists from database for the season."""
+    conn = get_db()
+    cur = conn.cursor()
+
+    start, end = get_season_dates(season)
+
+    cur.execute("""
+        SELECT * FROM shots
+        WHERE assisted = 1
+          AND game_date BETWEEN ? AND ?
+    """, (start, end))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    return [row_to_dict(r) for r in rows]
+
+
+def compute_single_assist_AQR_raw(shot, season):
+    """
+    Compute raw AQR for a single assist (internal use only).
+    Returns raw multiplicative value.
+    """
+    shooter_id = shot["player_id"]
+    skills = get_or_compute_skill(shooter_id, season)
+    return compute_AQR_for_shot_raw(shot, skills, season)
+
+
+def shrink_aqr(mean_aqr, n, league_avg, m=250):
+    """
+    Apply Bayesian shrinkage to a mean AQR value.
+
+    Args:
+        mean_aqr: Raw mean AQR value
+        n: Number of assists
+        league_avg: League average raw AQR
+        m: Shrinkage parameter (default 250)
+
+    Returns:
+        Shrunk AQR value
+    """
+    return (n / (n + m)) * mean_aqr + (m / (n + m)) * league_avg
+
+
+def compute_aqr_statistics(season="2024-25", force_refresh=False):
+    """
+    Compute AQR statistics from all assists in the database.
+    Returns dict with mean, std, and percentiles.
+    Results are cached for performance.
+    """
+    global AQR_STATS_CACHE
+
+    if season in AQR_STATS_CACHE and not force_refresh:
+        return AQR_STATS_CACHE[season]
+
+    print(f"Computing AQR statistics for {season}...")
+    assists = fetch_all_assists(season)
+    print(f"Loaded {len(assists):,} assists")
+
+    all_aqrs = []
+    for i, shot in enumerate(assists):
+        if i % 5000 == 0 and i > 0:
+            print(f"  Processed {i:,}/{len(assists):,}...")
+
+        try:
+            aqr = compute_single_assist_AQR_raw(shot, season)
+            all_aqrs.append(aqr)
+        except Exception:
+            continue
+
+    print(f"Successfully computed {len(all_aqrs):,} AQR values")
+
+    # Calculate statistics
+    stats = {
+        "mean": statistics.mean(all_aqrs),
+        "stdev": statistics.stdev(all_aqrs),
+        "min": min(all_aqrs),
+        "max": max(all_aqrs),
+        "median": statistics.median(all_aqrs),
+        "p5": statistics.quantiles(all_aqrs, n=20)[0],   # 5th percentile
+        "p10": statistics.quantiles(all_aqrs, n=10)[0],  # 10th percentile
+        "p25": statistics.quantiles(all_aqrs, n=4)[0],   # 25th percentile
+        "p75": statistics.quantiles(all_aqrs, n=4)[2],   # 75th percentile
+        "p90": statistics.quantiles(all_aqrs, n=10)[8],  # 90th percentile
+        "p95": statistics.quantiles(all_aqrs, n=20)[18], # 95th percentile
+        "all_values": sorted(all_aqrs)  # Store for percentile lookups
+    }
+
+    # Cache the results
+    AQR_STATS_CACHE[season] = stats
+
+    print(f"\nAQR Statistics for {season}:")
+    print(f"  Mean:   {stats['mean']:.4f}")
+    print(f"  Stdev:  {stats['stdev']:.4f}")
+    print(f"  Min:    {stats['min']:.4f}")
+    print(f"  Max:    {stats['max']:.4f}")
+    print(f"  Median: {stats['median']:.4f}")
+    print(f"  P5:     {stats['p5']:.4f}")
+    print(f"  P25:    {stats['p25']:.4f}")
+    print(f"  P75:    {stats['p75']:.4f}")
+    print(f"  P95:    {stats['p95']:.4f}\n")
+
+    return stats
+
+
+def normalize_aqr(raw_aqr, season="2024-25"):
+    """
+    Convert raw AQR to 1-100 scale based on percentile rank.
+
+    Args:
+        raw_aqr: Raw AQR value
+        season: Season to use for normalization
+
+    Returns:
+        Normalized AQR on 1-100 scale
+    """
+    stats = compute_aqr_statistics(season)
+    all_values = stats["all_values"]
+
+    # Find percentile rank
+    rank = sum(1 for x in all_values if x < raw_aqr)
+    percentile = (rank / len(all_values)) * 99 + 1  # Scale to 1-100
+
+    return round(percentile, 1)
+
+
+def compute_single_assist_AQR(shot, season="2024-25"):
+    """
+    Compute normalized AQR for a single assist.
+    This is the main public function - always returns 1-100 normalized value.
+
+    Args:
+        shot: Shot dictionary
+        season: Season string
+
+    Returns:
+        Normalized AQR on 1-100 scale
+    """
+    raw_aqr = compute_single_assist_AQR_raw(shot, season)
+    return normalize_aqr(raw_aqr, season)
+
+
+def get_aqr_with_breakdown(shot, season="2024-25"):
+    """
+    Compute AQR with component breakdown for display.
+
+    Returns:
+        dict with raw_aqr, normalized_aqr, and component values
+    """
+    shooter_id = shot["player_id"]
+    skills = get_or_compute_skill(shooter_id, season)
+    zone = get_zone(shot)
+
+    # Component values
+    creation = get_creation_boost(shot)
+    skill = skills.get(zone, 1.0)
+    defense = get_defense_factor(season, shot["opponent"])
+    clutch = get_clutch_factor(shot)
+    distance = get_distance_factor(shot)
+
+    raw_aqr = creation * skill * defense * clutch * distance
+    normalized_aqr = normalize_aqr(raw_aqr, season)
+
+    return {
+        "raw_aqr": raw_aqr,
+        "normalized_aqr": normalized_aqr,
+        "creation": creation,
+        "skill": skill,
+        "defense": defense,
+        "clutch": clutch,
+        "distance": distance
+    }
+
+
+# ============================================================
 # 6. ------- AQR MAIN FUNCTIONS
 # ============================================================
 
@@ -289,28 +473,50 @@ def list_assists_for_game(assister_id, team_abbrev, game_id, season):
     return [a for a in assists if a["gid"] == game_id]
 
 
-def compute_single_assist_AQR(shot, season):
-    shooter_id = shot["player_id"]
-    skills = get_or_compute_skill(shooter_id, season)
-    return compute_AQR_for_shot(shot, skills, season)
-
-
 def avg_assister_game(assister_id, team_abbrev, game_id, season):
+    """
+    Calculate average AQR for a player in a single game.
+    Applies shrinkage and returns normalized 1-100 value.
+    """
     assists = list_assists_for_game(assister_id, team_abbrev, game_id, season)
     if not assists:
         return None
 
-    vals = [compute_single_assist_AQR(a, season) for a in assists]
-    return sum(vals) / len(vals)
+    # Get raw AQR values
+    raw_vals = [compute_single_assist_AQR_raw(a, season) for a in assists]
+    n = len(raw_vals)
+    mean_raw = sum(raw_vals) / n
+
+    # Apply shrinkage
+    stats = compute_aqr_statistics(season)
+    league_avg = stats["mean"]
+    shrunk_raw = shrink_aqr(mean_raw, n, league_avg)
+
+    # Normalize to 1-100
+    return normalize_aqr(shrunk_raw, season)
 
 
 def avg_assister_season(assister_id, team_abbrev, season):
+    """
+    Calculate average AQR for a player across the season.
+    Applies shrinkage and returns normalized 1-100 value.
+    """
     assists = fetch_assists_by_assister(assister_id, team_abbrev, season)
     if not assists:
         return None
 
-    vals = [compute_single_assist_AQR(a, season) for a in assists]
-    return sum(vals) / len(vals)
+    # Get raw AQR values
+    raw_vals = [compute_single_assist_AQR_raw(a, season) for a in assists]
+    n = len(raw_vals)
+    mean_raw = sum(raw_vals) / n
+
+    # Apply shrinkage
+    stats = compute_aqr_statistics(season)
+    league_avg = stats["mean"]
+    shrunk_raw = shrink_aqr(mean_raw, n, league_avg)
+
+    # Normalize to 1-100
+    return normalize_aqr(shrunk_raw, season)
 
 
 # ============================================================
@@ -325,36 +531,46 @@ def analyze_assister(assister_id, team_abbrev, season):
         print("No assists found.")
         return
 
-    aqrs = [compute_single_assist_AQR(a, season) for a in assists]
+    # Get raw values for statistics
+    raw_aqrs = [compute_single_assist_AQR_raw(a, season) for a in assists]
+    normalized_aqrs = [compute_single_assist_AQR(a, season) for a in assists]
+
+    # Calculate average with shrinkage
+    n = len(raw_aqrs)
+    mean_raw = sum(raw_aqrs) / n
+    stats = compute_aqr_statistics(season)
+    league_avg = stats["mean"]
+    shrunk_raw = shrink_aqr(mean_raw, n, league_avg)
+    shrunk_normalized = normalize_aqr(shrunk_raw, season)
 
     print(f"\n{'='*50}")
     print(f"AQR Analysis: {assists[0]['assist_player']}")
     print(f"{'='*50}")
-    print(f"Total Assists: {len(aqrs)}")
-    print(f"Mean AQR: {sum(aqrs)/len(aqrs):.3f}")
-    print(f"Min AQR: {min(aqrs):.3f}")
-    print(f"Max AQR: {max(aqrs):.3f}")
+    print(f"Total Assists: {len(raw_aqrs)}")
+    print(f"Average AQR (Shrunk): {shrunk_normalized:.1f} / 100")
+    print(f"Min AQR: {min(normalized_aqrs):.1f} / 100")
+    print(f"Max AQR: {max(normalized_aqrs):.1f} / 100")
 
     # By zone
     by_zone = defaultdict(list)
-    for a, aqr in zip(assists, aqrs):
+    for a, aqr in zip(assists, normalized_aqrs):
         by_zone[get_zone(a)].append(aqr)
 
     print(f"\nBy Zone:")
     for zone in ["AtRim", "ShortMidRange", "LongMidRange", "Arc3", "Corner3"]:
         if zone in by_zone:
             vals = by_zone[zone]
-            print(f"  {zone:15} | {len(vals):3} assists | avg AQR: {sum(vals)/len(vals):.3f}")
+            print(f"  {zone:15} | {len(vals):3} assists | avg AQR: {sum(vals)/len(vals):.1f}")
 
     # Top 5 assists
-    sorted_assists = sorted(zip(assists, aqrs), key=lambda x: x[1], reverse=True)
+    sorted_assists = sorted(zip(assists, normalized_aqrs), key=lambda x: x[1], reverse=True)
     print(f"\nTop 5 Assists:")
     for a, aqr in sorted_assists[:5]:
-        print(f"  AQR {aqr:.3f} | {a['player']:20} | {a['shot_type']:15} | {a['game_date']}")
+        print(f"  AQR {aqr:.1f} | {a['player']:20} | {a['shot_type']:15} | {a['game_date']}")
 
     # By shooter
     by_shooter = defaultdict(list)
-    for a, aqr in zip(assists, aqrs):
+    for a, aqr in zip(assists, normalized_aqrs):
         by_shooter[a['player']].append(aqr)
 
     print(f"\nTop 5 Shooter Connections (min 10 assists):")
@@ -365,29 +581,29 @@ def analyze_assister(assister_id, team_abbrev, season):
     ]
     shooter_avgs.sort(key=lambda x: x[2], reverse=True)
     for name, count, avg in shooter_avgs[:5]:
-        print(f"  {name:20} | {count:3} assists | avg AQR: {avg:.3f}")
+        print(f"  {name:20} | {count:3} assists | avg AQR: {avg:.1f}")
 
 
 def compare_assisters(player_ids, team_abbrev, season):
-    """Compare multiple assisters' AQR."""
+    """Compare multiple assisters' AQR (with shrinkage applied)."""
     print(f"\n{'='*50}")
     print(f"AQR Comparison - {season}")
     print(f"{'='*50}")
-    print(f"{'Player':<25} | {'Assists':>7} | {'Avg AQR':>8}")
+    print(f"{'Player':<25} | {'Assists':>7} | {'AQR/100':>8}")
     print("-" * 50)
 
     results = []
     for pid in player_ids:
-        assists = fetch_assists_by_assister(pid, team_abbrev, season)
-        if assists:
-            aqrs = [compute_single_assist_AQR(a, season) for a in assists]
+        # Use the avg_assister_season which applies shrinkage and normalization
+        avg_normalized = avg_assister_season(pid, team_abbrev, season)
+        if avg_normalized is not None:
+            assists = fetch_assists_by_assister(pid, team_abbrev, season)
             name = assists[0]['assist_player']
-            avg_aqr = sum(aqrs) / len(aqrs)
-            results.append((name, len(aqrs), avg_aqr))
+            results.append((name, len(assists), avg_normalized))
 
     results.sort(key=lambda x: x[2], reverse=True)
-    for name, count, avg in results:
-        print(f"{name:<25} | {count:>7} | {avg:>8.3f}")
+    for name, count, aqr in results:
+        print(f"{name:<25} | {count:>7} | {aqr:>8.1f}")
 
 
 # ============================================================
@@ -423,21 +639,20 @@ def cli_single_assist():
         print(f"  {i}. {s['player']:20} | P{s['period']} {s['time']} | {s['shot_type']} ({s['shot_distance']}ft)")
 
     idx = int(input("\nPick assist #: ")) - 1
-    aqr = compute_single_assist_AQR(assists[idx], season)
-
-    # Show breakdown
     shot = assists[idx]
-    skills = get_or_compute_skill(shot["player_id"], season)
-    zone = get_zone(shot)
+
+    # Get breakdown
+    breakdown = get_aqr_with_breakdown(shot, season)
 
     print(f"\n--- AQR Breakdown ---")
-    print(f"Creation Boost:  {get_creation_boost(shot):.3f}")
-    print(f"Shooter Skill:   {skills.get(zone, 1.0):.3f}")
-    print(f"Defense Factor:  {get_defense_factor(season, shot['opponent']):.3f}")
-    print(f"Clutch Factor:   {get_clutch_factor(shot):.3f}")
-    print(f"Distance Factor: {get_distance_factor(shot):.3f}")
+    print(f"Creation Boost:  {breakdown['creation']:.3f}")
+    print(f"Shooter Skill:   {breakdown['skill']:.3f}")
+    print(f"Defense Factor:  {breakdown['defense']:.3f}")
+    print(f"Clutch Factor:   {breakdown['clutch']:.3f}")
+    print(f"Distance Factor: {breakdown['distance']:.3f}")
     print(f"--------------------")
-    print(f"TOTAL AQR:       {aqr:.3f}")
+    print(f"Raw AQR:         {breakdown['raw_aqr']:.3f}")
+    print(f"Normalized AQR:  {breakdown['normalized_aqr']:.1f} / 100")
 
 
 def cli_game_avg():
@@ -451,14 +666,18 @@ def cli_game_avg():
         print("No assists found.")
         return
 
-    aqrs = [compute_single_assist_AQR(a, season) for a in assists]
+    # Get shrunk and normalized average
+    avg_normalized = avg_assister_game(int(assister), team, game, season)
+
+    # Get individual normalized AQRs
+    individual_aqrs = [compute_single_assist_AQR(a, season) for a in assists]
 
     print(f"\nGame: {game}")
-    print(f"Assists: {len(aqrs)}")
-    print(f"Average AQR: {sum(aqrs)/len(aqrs):.3f}")
+    print(f"Assists: {len(assists)}")
+    print(f"Average AQR (Shrunk): {avg_normalized:.1f} / 100")
     print(f"\nIndividual assists:")
-    for a, aqr in zip(assists, aqrs):
-        print(f"  {a['player']:20} | {a['shot_type']:15} | AQR: {aqr:.3f}")
+    for a, aqr in zip(assists, individual_aqrs):
+        print(f"  {a['player']:20} | {a['shot_type']:15} | AQR: {aqr:.1f}")
 
 
 def cli_season_avg():
@@ -466,9 +685,10 @@ def cli_season_avg():
     team = input("Team abbreviation (e.g. ATL): ").strip().upper()
     season = input("Season (default 2024-25): ").strip() or "2024-25"
 
+    # Result is already shrunk and normalized
     result = avg_assister_season(int(assister), team, season)
     if result:
-        print(f"\nSeason Average AQR: {result:.3f}")
+        print(f"\nSeason Average AQR (Shrunk): {result:.1f} / 100")
     else:
         print("No assists found.")
 
@@ -489,137 +709,102 @@ def cli_compare():
     player_ids = [int(x.strip()) for x in ids_input.split(",")]
     compare_assisters(player_ids, team, season)
 
-import sqlite3
-import statistics
-from collections import defaultdict
+# ============================================================
+# 9. ------- LEAGUE-WIDE RANKINGS
+# ============================================================
 
-# =============================================
-# 1. Shrinkage function (Bayesian smoothing)
-# =============================================
-
-def shrink_aqr(mean_aqr, n, league_avg=1.0158, m=250):
+def compute_adjusted_rankings(season="2024-25", min_assists=50):
     """
-    Bayesian shrinkage:
-        shrunk = (n / (n+m)) * mean + (m / (n+m)) * league_mean
+    Compute normalized AQR rankings for all passers in the league.
+    Applies shrinkage to player averages, then normalizes to 1-100 scale.
     """
-    return (n / (n + m)) * mean_aqr + (m / (n + m)) * league_avg
+    # Compute statistics once (will use cache if already computed)
+    stats = compute_aqr_statistics(season)
+    league_avg = stats["mean"]
 
-
-# =============================================
-# 2. Load assists + compute AQR for each
-# =============================================
-
-from AQR_CLI_DB import (
-    row_to_dict,
-    compute_single_assist_AQR,
-    get_season_dates,
-)
-
-def load_all_assists(season="2024-25"):
-    conn = sqlite3.connect("shots.db")
-    cur = conn.cursor()
-
-    start, end = get_season_dates(season)
-
-    cur.execute("""
-        SELECT * FROM shots
-        WHERE assisted = 1
-          AND game_date BETWEEN ? AND ?
-    """, (start, end))
-
-    rows = cur.fetchall()
-    conn.close()
-
-    return [row_to_dict(r) for r in rows]
-
-
-# =============================================
-# 3. Compute passer stats
-# =============================================
-
-def compute_adjusted_rankings(season="2024-25"):
     print("Loading all assists...")
-    assists = load_all_assists(season)
+    assists = fetch_all_assists(season)
 
-    print(f"Computing AQR for {len(assists):,} assists...")
+    print(f"Computing raw AQR for {len(assists):,} assists...")
 
-    passer_to_aqrs = defaultdict(list)
+    passer_to_raw_aqrs = defaultdict(list)
+    passer_to_norm_aqrs = defaultdict(list)
     passer_names = {}
+    passer_teams = {}
 
     for i, a in enumerate(assists):
         if i % 5000 == 0 and i > 0:
             print(f"  Processed {i:,}...")
 
         try:
-            aqr = compute_single_assist_AQR(a, season)
-        except:
+            raw_aqr = compute_single_assist_AQR_raw(a, season)
+            norm_aqr = normalize_aqr(raw_aqr, season)
+        except Exception:
             continue
 
         pid = a["assist_player_id"]
         if pid is None:
             continue
 
-        passer_to_aqrs[pid].append(aqr)
+        passer_to_raw_aqrs[pid].append(raw_aqr)
+        passer_to_norm_aqrs[pid].append(norm_aqr)
         passer_names[pid] = a["assist_player"]
+        passer_teams[pid] = a["team"]
 
     print("Finished computing AQRs.\n")
 
-    # =============================================
-    # League average (for shrinkage)
-    # =============================================
-    all_aqrs = [aqr for vals in passer_to_aqrs.values() for aqr in vals]
-    league_avg = statistics.mean(all_aqrs)
-    print(f"League average AQR = {league_avg:.4f}\n")
+    # Build stats table with shrunk and normalized scores
+    results_table = []
 
-    # =============================================
-    # Build stats table
-    # =============================================
-
-    table = []
-    MIN_ASSISTS = 50  # can change threshold
-
-    for pid, vals in passer_to_aqrs.items():
-        n = len(vals)
-        if n < MIN_ASSISTS:
+    for pid, raw_vals in passer_to_raw_aqrs.items():
+        n = len(raw_vals)
+        if n < min_assists:
             continue
 
-        mean_aqr = statistics.mean(vals)
-        shrunk = shrink_aqr(mean_aqr, n, league_avg=league_avg, m=250)
+        # Calculate mean of raw values
+        mean_raw = statistics.mean(raw_vals)
 
-        table.append({
+        # Apply shrinkage
+        shrunk_raw = shrink_aqr(mean_raw, n, league_avg)
+
+        # Normalize shrunk value
+        normalized = normalize_aqr(shrunk_raw, season)
+
+        # Get normalized individual values for elite/bad percentages
+        norm_vals = passer_to_norm_aqrs[pid]
+
+        results_table.append({
             "pid": pid,
             "name": passer_names.get(pid, "Unknown"),
+            "team": passer_teams.get(pid, ""),
             "assists": n,
-            "mean": mean_aqr,
-            "shrunk": shrunk,
-            "elite_pct": sum(1 for x in vals if x >= 1.2) / n * 100,
-            "bad_pct": sum(1 for x in vals if x < 0.9) / n * 100
+            "raw_mean": mean_raw,
+            "normalized": normalized,
+            "elite_pct": sum(1 for x in norm_vals if x >= 80) / n * 100,  # Top 20%
+            "bad_pct": sum(1 for x in norm_vals if x < 40) / n * 100      # Bottom 40%
         })
 
-    # sort by adjusted value
-    table.sort(key=lambda x: x["shrunk"], reverse=True)
+    # Sort by normalized AQR
+    results_table.sort(key=lambda x: x["normalized"], reverse=True)
 
-    return table
+    return results_table
 
 
-# =============================================
-# 4. Pretty print rankings
-# =============================================
+def print_rankings(results_table, limit=50):
+    """Print normalized AQR rankings with shrinkage applied."""
+    print("="*95)
+    print(f"{'AQR PASSER RANKINGS (SHRUNK & NORMALIZED 1-100)':^95}")
+    print("="*95)
 
-def print_rankings(table, limit=50):
-    print("="*80)
-    print(f"{'ADJUSTED AQR PASSER RANKINGS (SHRUNK AQR)':^80}")
-    print("="*80)
+    print(f"\n{'Rank':<5} | {'Player':<22} | {'Team':>4} | {'Ast':>5} | {'AQR/100':>7} | {'Elite%':>7} | {'Bad%':>6}")
+    print("-"*95)
 
-    print(f"\n{'Rank':<5} | {'Player':<22} | {'Ast':>5} | {'Mean':>6} | {'AdjAQR':>7} | {'Elite%':>7} | {'Bad%':>6}")
-    print("-"*80)
-
-    for i, row in enumerate(table[:limit], 1):
+    for i, row in enumerate(results_table[:limit], 1):
         print(f"{i:<5} | "
               f"{row['name']:<22} | "
+              f"{row['team']:>4} | "
               f"{row['assists']:>5} | "
-              f"{row['mean']:>6.3f} | "
-              f"{row['shrunk']:>7.3f} | "
+              f"{row['normalized']:>7.1f} | "
               f"{row['elite_pct']:>6.1f}% | "
               f"{row['bad_pct']:>5.1f}%")
 

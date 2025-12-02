@@ -6,24 +6,48 @@ from collections import defaultdict
 # ============================================================
 
 def get_zone(shot):
-    """Map shot_type + distance into consistent shot zones."""
-    st = shot["shot_type"]
-    dist = shot["shot_distance"]
+    st = shot.get("shot_type")
+    dist = shot.get("shot_distance")
+    x = shot.get("x")  # used for corner 3 detection
 
-    # Handle 3s first (only reliable 3pt indicator)
-    if st == "Corner3":
-        return "Corner3"
-    if st in ("AboveBreak3", "Arc3"):
+    # 1. — Direct mapping if shot_type is valid
+    TYPE_MAP = {
+        "AtRim": "AtRim",
+        "ShortMidRange": "ShortMidRange",
+        "LongMidRange": "LongMidRange",
+        "Corner3": "Corner3",
+        "Arc3": "Arc3",
+        "AboveBreak3": "Arc3",
+    }
+
+    if st in TYPE_MAP:
+        return TYPE_MAP[st]
+
+    # -------------------------------
+    # 2. — FALLBACK: Distance-based classification
+    # -------------------------------
+
+    if dist is None:
+        return "LongMidRange"  # safest neutral default
+
+    # A. Rim
+    if dist <= 4.5:
+        return "AtRim"
+
+    # B. Short mid
+    if dist <= 14:
+        return "ShortMidRange"
+
+    # C. 3PT detection by distance first (NBA 3pt line ≈ 22+ ft)
+    if dist >= 22:
+        # If coordinates available → check corner 3
+        if x is not None:
+            if abs(x) > 22 and dist <= 22.5:
+                return "Corner3"
         return "Arc3"
 
-    # Handle 2s by distance
-    if dist <= 5:
-        return "AtRim"
-    elif dist <= 14:
-        return "ShortMidRange"
-    else:
-        return "LongMidRange"
-
+    # D. Long mid (non-3)
+    return "LongMidRange"
 
 # ============================================================
 # 2. ------- DATA FETCHING FROM PBPSTATS
@@ -224,4 +248,4 @@ if __name__ == "__main__":
     AQRs, skills = compute_player_AQR("1626181")  # Example player
     print("Sample Shot:", get_player_shots(1626181, "2024-25")[0])
     print("Shooter Skill:", skills)
-    print("Sample AQRs:", AQRs[:10])
+    print("Sample AQRs:", sum(AQRs)/len(AQRs))
